@@ -1,0 +1,9 @@
+"""Events this module emits (see ARCHITECTURE.md §5)."""
+
+from app.shared.events import (
+    SUBSCRIPTION_CANCELLED,
+    SUBSCRIPTION_PAYMENT_FAILED,
+    SUBSCRIPTION_STARTED,
+)
+
+__all__ = ["SUBSCRIPTION_STARTED", "SUBSCRIPTION_CANCELLED", "SUBSCRIPTION_PAYMENT_FAILED"]

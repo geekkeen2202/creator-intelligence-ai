@@ -1,0 +1,59 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build: ./backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file: ./backend/.env
+    environment:
+      # DATABASE_URL comes from backend/.env (Supabase Postgres) — no local DB container.
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - redis
+
+  worker:
+    build: ./backend
+    command: celery -A app.tasks.celery_app worker --loglevel=info
+    env_file: ./backend/.env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - redis
+
+  beat:
+    build: ./backend
+    command: celery -A app.tasks.celery_app beat --loglevel=info
+    env_file: ./backend/.env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - redis
+
+  flower:
+    build: ./backend
+    command: celery -A app.tasks.celery_app flower --port=5555
+    env_file: ./backend/.env
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis

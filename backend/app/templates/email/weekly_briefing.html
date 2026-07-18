@@ -1,0 +1,16 @@
+<!doctype html>
+<html>
+  <body style="font-family: sans-serif; color: #111;">
+    <h1>Your weekly briefing</h1>
+    {% if top_topics %}
+      <p>Trending in your niche this week:</p>
+      <ul>
+        {% for topic in top_topics %}
+          <li>{{ topic }}</li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p>Check the app for this week's trending topics in your niche.</p>
+    {% endif %}
+  </body>
+</html>

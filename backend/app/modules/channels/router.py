@@ -1,0 +1,49 @@
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.modules.channels.repository import ChannelRepository
+from app.modules.channels.schemas import ChannelConnectRequest, ChannelRead
+from app.modules.channels.service import ChannelService
+from app.shared.database import get_db
+from app.shared.security import CurrentUser, get_current_user
+
+router = APIRouter(prefix="/channels", tags=["channels"])
+
+
+def get_service(db: Annotated[AsyncSession, Depends(get_db)]) -> ChannelService:
+    return ChannelService(ChannelRepository(db))
+
+
+@router.post("", response_model=ChannelRead, status_code=status.HTTP_201_CREATED)
+async def connect_channel(
+    body: ChannelConnectRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    service: Annotated[ChannelService, Depends(get_service)],
+):
+    return await service.connect_channel(
+        user_id=UUID(user.user_id),
+        platform=body.platform,
+        external_channel_id=body.external_channel_id,
+    )
+
+
+@router.get("", response_model=list[ChannelRead])
+async def list_channels(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    service: Annotated[ChannelService, Depends(get_service)],
+):
+    return await service.list_channels(UUID(user.user_id))
+
+
+@router.get("/{channel_id}", response_model=ChannelRead)
+async def get_channel(
+    channel_id: UUID,
+    service: Annotated[ChannelService, Depends(get_service)],
+):
+    channel = await service.get_channel(channel_id)
+    if channel is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
+    return channel
