@@ -1,3 +1,4 @@
+from datetime import date
 from uuid import UUID
 
 from app.modules.billing.events import (
@@ -22,6 +23,9 @@ class BillingService:
         )
         emit(SUBSCRIPTION_STARTED, {"user_id": str(user_id), "subscription_id": str(sub.id)})
         return sub
+
+    async def get_usage_summary(self, user_id: UUID, since: date) -> list[dict]:
+        return await self._repository.usage_summary(user_id, since)
 
     async def handle_webhook_event(self, event_type: str, provider_subscription_id: str) -> None:
         if event_type == "subscription.cancelled":

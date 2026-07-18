@@ -3,10 +3,13 @@ from uuid import uuid4
 
 import pytest
 
+from app.ai.agents.voice_dna_agent import VoiceDNA
 from app.modules.voice_profiles import service as service_module
 from app.modules.voice_profiles.models import TranscriptSegment
 from app.modules.voice_profiles.service import (
     VoiceProfileService,
+    _consolidate,
+    _curate_excerpts,
     _format_prompt_block,
     _segment_text,
     get_prompt_block,
@@ -36,7 +39,9 @@ class FakeRepository:
     async def get_video(self, video_id):
         return self.videos.get(video_id)
 
-    async def create_transcript(self, *, video_id, source, quality_score):
+    async def create_transcript(
+        self, *, video_id, source, quality_score, language_detected=None, raw_text="", clean_text=""
+    ):
         transcript = SimpleNamespace(id=uuid4(), video_id=video_id, source=source)
         self.transcripts.append(transcript)
         return transcript
@@ -50,8 +55,14 @@ class FakeRepository:
     async def list_segments_for_channel(self, channel_id, limit=200):
         return self.segments
 
+    async def list_segments_by_transcript_for_channel(self, channel_id):
+        return [self.segments] if self.segments else []
+
     async def get_latest_version_number(self, channel_id):
         return self.versions.get(channel_id, 0)
+
+    async def get_latest_version(self, channel_id):
+        return None
 
     async def create_version(self, **kwargs):
         self.created_version_kwargs = kwargs
@@ -72,7 +83,7 @@ class FakeSocial:
 
 class FakeTranscription:
     async def transcribe(self, audio_bytes):
-        return "whisper text.", 0.6
+        return "whisper text.", 0.6, "english"
 
 
 class FakeVoiceDNA:
@@ -118,7 +129,7 @@ async def test_transcribe_video_prefers_captions_over_whisper():
     repo.videos[video_id] = SimpleNamespace(
         id=video_id, channel_id=uuid4(), external_video_id="ext1"
     )
-    social = FakeSocial(captions=("Caption hook. Caption body. Caption cta.", 0.9))
+    social = FakeSocial(captions=("Caption hook. Caption body. Caption cta.", 0.9, "en"))
     service = VoiceProfileService(
         repo, db=None, redis=None, social=social, transcription=FakeTranscription()
     )
@@ -129,7 +140,7 @@ async def test_transcribe_video_prefers_captions_over_whisper():
     assert any(s.text == "Caption hook." for s in repo.segments)
 
 
-async def test_transcribe_video_falls_back_to_whisper_when_no_captions():
+async def test_transcribe_video_falls_back_to_whisper_when_no_captions(monkeypatch):
     repo = FakeRepository()
     video_id = uuid4()
     repo.videos[video_id] = SimpleNamespace(
@@ -140,9 +151,47 @@ async def test_transcribe_video_falls_back_to_whisper_when_no_captions():
         repo, db=None, redis=None, social=social, transcription=FakeTranscription()
     )
 
+    async def fake_get_owner(db, channel_id):
+        return None  # exercises the "channel not found, skip metering" path
+
+    monkeypatch.setattr(service_module.channels, "get_owner_user_id", fake_get_owner)
+
     await service.transcribe_video(video_id)
 
     assert repo.transcripts[0].source == "whisper"
+
+
+async def test_transcribe_video_meters_whisper_cost(monkeypatch):
+    repo = FakeRepository()
+    video_id = uuid4()
+    channel_id = uuid4()
+    user_id = uuid4()
+    repo.videos[video_id] = SimpleNamespace(
+        id=video_id, channel_id=channel_id, external_video_id="ext1"
+    )
+    social = FakeSocial(captions=None)
+    service = VoiceProfileService(
+        repo, db=None, redis=None, social=social, transcription=FakeTranscription()
+    )
+
+    async def fake_get_owner(db, cid):
+        assert cid == channel_id
+        return user_id
+
+    recorded = {}
+
+    async def fake_record_usage(db, uid, day, **kwargs):
+        recorded["user_id"] = uid
+        recorded.update(kwargs)
+
+    monkeypatch.setattr(service_module.channels, "get_owner_user_id", fake_get_owner)
+    monkeypatch.setattr(service_module.billing, "record_usage", fake_record_usage)
+
+    await service.transcribe_video(video_id)
+
+    assert recorded["user_id"] == user_id
+    assert recorded["feature"] == "whisper_minutes"
+    assert recorded["cost"] > 0
 
 
 async def test_transcribe_video_raises_when_no_captions_and_no_transcription_port():
@@ -280,3 +329,90 @@ async def test_get_prompt_block_falls_back_on_malformed_profile(monkeypatch):
     result = await get_prompt_block(db=None, redis=FakeRedis(), channel_id=uuid4())
 
     assert result == "Voice DNA: not yet available"
+
+
+def _voice_dna(phrases, tone="casual"):
+    return VoiceDNA(
+        tone=tone,
+        pacing="medium",
+        vocabulary_level="simple",
+        signature_phrases=phrases,
+        hook_style="question",
+        cta_style="soft",
+    )
+
+
+def test_consolidate_single_batch_passthrough():
+    only = _voice_dna(["let's go"])
+    assert _consolidate([only]) is only
+
+
+def test_consolidate_keeps_only_recurring_phrases_across_batches():
+    latest = _voice_dna(["let's go", "one-off phrase"])
+    older = _voice_dna(["let's go", "different one-off"])
+    merged = _consolidate([latest, older])
+
+    assert merged.tone == "casual"  # scalar fields come from latest (batches[0])
+    assert "let's go" in merged.signature_phrases  # recurs across batches
+    assert "one-off phrase" not in merged.signature_phrases  # only ever seen once
+    assert "different one-off" not in merged.signature_phrases
+
+
+def test_consolidate_keeps_all_phrases_when_nothing_recurs():
+    latest = _voice_dna(["alpha"])
+    older = _voice_dna(["beta"])
+    merged = _consolidate([latest, older])
+
+    assert set(merged.signature_phrases) == {"alpha", "beta"}
+
+
+def test_curate_excerpts_prioritizes_hook_and_cta_variety():
+    body_segments = [
+        TranscriptSegment(transcript_id=uuid4(), segment_type="body", text="b" * n)
+        for n in range(1, 10)
+    ]
+    segments = (
+        body_segments
+        + [TranscriptSegment(transcript_id=uuid4(), segment_type="hook", text="hook text")]
+        + [TranscriptSegment(transcript_id=uuid4(), segment_type="cta", text="cta text")]
+    )
+    curated = _curate_excerpts(segments)
+
+    assert len(curated) <= 12
+    assert any(s.segment_type == "hook" for s in curated)
+    assert any(s.segment_type == "cta" for s in curated)
+
+
+async def test_refine_profile_returns_false_when_no_prior_version():
+    repo = FakeRepository()
+    service = VoiceProfileService(repo, db=None, redis=FakeRedis(), social=FakeSocial())
+
+    refined = await service.refine_profile(uuid4())
+
+    assert refined is False
+
+
+async def test_refine_profile_returns_false_when_no_new_signal(monkeypatch):
+    repo = FakeRepository()
+    latest = SimpleNamespace(
+        version=1,
+        created_at=uuid4(),  # unused by the fake below, just needs to exist
+        profile=_voice_dna(["x"]).model_dump(),
+        confidence={"tone": "high"},
+        excerpt_ids=[],
+    )
+    repo.get_latest_version = lambda channel_id: _async_return(latest)
+
+    async def fake_list_feedback_since(db, channel_id, since):
+        return []
+
+    monkeypatch.setattr(service_module.scripts, "list_feedback_since", fake_list_feedback_since)
+
+    service = VoiceProfileService(repo, db=None, redis=FakeRedis(), social=FakeSocial())
+    refined = await service.refine_profile(uuid4())
+
+    assert refined is False
+
+
+async def _async_return(value):
+    return value

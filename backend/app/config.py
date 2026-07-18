@@ -8,7 +8,6 @@ class Settings(BaseSettings):
 
     environment: str = "local"
     debug: bool = False
-    secret_key: str = "change-me"
     cors_origins: str = ""  # comma-separated, e.g. "https://app.example.com,https://staging.example.com"
 
     database_url: str
@@ -22,8 +21,15 @@ class Settings(BaseSettings):
 
     openrouter_api_key: str = ""
     openrouter_model: str = "anthropic/claude-sonnet-4-6"
+    # Cheaper/faster route for short-form tasks (Shorts hooks/captions/hashtags —
+    # TechnicalDesign.md §5.2). Empty = same as openrouter_model.
+    openrouter_fast_model: str = ""
 
     openai_api_key: str = ""  # Whisper fallback transcription only (TranscriptionPort)
+    # $/minute — OpenAI's published whisper-1 rate as of this writing; verify
+    # against https://openai.com/api/pricing before relying on this for
+    # real billing (ARCHITECTURE.md §8 rule 11 cost metering).
+    whisper_price_per_minute: float = 0.006
 
     youtube_api_key: str = ""
     x_bearer_token: str = ""

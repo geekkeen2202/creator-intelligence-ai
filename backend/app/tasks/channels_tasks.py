@@ -1,4 +1,3 @@
-import asyncio
 from uuid import UUID
 
 import structlog
@@ -11,7 +10,7 @@ from app.config import get_settings
 from app.modules.channels.repository import ChannelRepository
 from app.modules.voice_profiles.repository import VoiceProfileRepository
 from app.modules.voice_profiles.service import VoiceProfileService
-from app.shared.events import CHANNEL_CONNECTED, subscribe
+from app.shared.events import CHANNEL_CONNECTED, run_with_event_flush, subscribe
 from app.tasks.celery_app import celery_app
 from app.tasks.voice_profile_tasks import extract_voice_profile, transcribe_video
 
@@ -27,7 +26,7 @@ def ingest_channel(self, payload: dict) -> None:
     the whole batch completes (Celery chord).
     """
     try:
-        video_ids = asyncio.run(_ingest(UUID(payload["channel_id"])))
+        video_ids = run_with_event_flush(_ingest(UUID(payload["channel_id"])))
     except Exception as exc:
         raise self.retry(exc=exc) from exc
 

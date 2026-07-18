@@ -1,4 +1,3 @@
-import asyncio
 
 import structlog
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -9,6 +8,7 @@ from app.config import get_settings
 from app.modules import users
 from app.modules.notifications.repository import NotificationRepository
 from app.modules.notifications.service import NotificationService
+from app.shared.events import run_with_event_flush
 from app.tasks.celery_app import celery_app
 
 log = structlog.get_logger(__name__)
@@ -20,7 +20,7 @@ log = structlog.get_logger(__name__)
 def send_weekly_briefing(self) -> None:
     """Runs Monday mornings via Celery Beat — sends a weekly briefing to every user."""
     try:
-        asyncio.run(_send_all())
+        run_with_event_flush(_send_all())
     except Exception as exc:
         raise self.retry(exc=exc) from exc
 

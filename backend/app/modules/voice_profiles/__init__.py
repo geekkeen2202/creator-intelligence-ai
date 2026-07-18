@@ -11,6 +11,7 @@ __all__ = [
     "get_prompt_block",
     "get_current_profile_version",
     "get_current_profile_dict",
+    "get_ingestion_status",
 ]
 
 
@@ -31,3 +32,9 @@ async def get_current_profile_version(db: AsyncSession, channel_id: UUID) -> int
     """Public interface for other modules needing the current profile
     version to stamp on provenance columns (ARCHITECTURE.md §8 rule 9)."""
     return await service.get_current_profile_version(db, channel_id)
+
+
+async def get_ingestion_status(db: AsyncSession, channel_id: UUID) -> dict:
+    """Public interface for the channels module's onboarding status endpoint
+    (TechnicalDesign.md §5.1)."""
+    return await service.get_ingestion_status(db, channel_id)

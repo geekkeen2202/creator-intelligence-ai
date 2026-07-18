@@ -1,7 +1,7 @@
 from datetime import date
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -73,3 +73,28 @@ class BillingRepository:
         )
         await self._db.execute(stmt)
         await self._db.commit()
+
+    async def usage_summary(self, user_id: UUID, since: date) -> list[dict]:
+        """M7 usage dashboard query (TechnicalDesign.md §8 rule 11) —
+        cost/tokens grouped by feature so "cost per script, cost per
+        onboarding" is answerable, not just written and forgotten."""
+        result = await self._db.execute(
+            select(
+                Usage.feature,
+                func.sum(Usage.tokens).label("total_tokens"),
+                func.sum(Usage.cost).label("total_cost"),
+                func.sum(Usage.scripts_generated).label("total_scripts_generated"),
+            )
+            .where(Usage.user_id == user_id, Usage.day >= since)
+            .group_by(Usage.feature)
+            .order_by(Usage.feature)
+        )
+        return [
+            {
+                "feature": row.feature,
+                "total_tokens": row.total_tokens or 0,
+                "total_cost": float(row.total_cost or 0),
+                "total_scripts_generated": row.total_scripts_generated or 0,
+            }
+            for row in result
+        ]

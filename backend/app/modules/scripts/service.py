@@ -4,6 +4,7 @@ from uuid import UUID
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.agents.script_agent import SHORT_FORM_PLATFORMS
 from app.ai.metrics import extract_usage
 from app.config import get_settings
 from app.modules import billing, trending, voice_profiles
@@ -15,9 +16,22 @@ from app.modules.scripts.agents import (
 )
 from app.modules.scripts.events import SCRIPT_GENERATED, SCRIPT_PUBLISHED, SCRIPT_RATED
 from app.modules.scripts.repository import ScriptRepository
+from app.shared import feature_flags
 from app.shared.events import emit
 
-_RATE_LIMIT_PER_HOUR = 20
+# Ships registered and disabled (ARCHITECTURE.md §7) — premium requests use
+# the single agent until a measured quality win enables the team pipeline.
+_SCRIPT_TEAM_FLAG = "script_team"
+
+# Per-tier hourly generation limits (TechnicalDesign.md §5.2/M4.3 — "premium
+# tiers differentiate on limits and features, not pipeline", §7). Numbers
+# are placeholders pending real pricing decisions; unknown/no plan = free.
+_RATE_LIMIT_BY_PLAN = {
+    "free": 5,
+    "creator": 20,
+    "unlimited": 200,
+}
+_DEFAULT_RATE_LIMIT_PER_HOUR = _RATE_LIMIT_BY_PLAN["free"]
 
 
 class ScriptGenerationLimitError(Exception):
@@ -33,6 +47,13 @@ class ScriptGenerationFailedError(Exception):
     transient with free-tier model routing; the caller should retry."""
 
 
+def _model_id_for(platform: str) -> str:
+    settings = get_settings()
+    if platform in SHORT_FORM_PLATFORMS:
+        return settings.openrouter_fast_model or settings.openrouter_model
+    return settings.openrouter_model
+
+
 class ScriptService:
     def __init__(self, repository: ScriptRepository, db: AsyncSession, redis: Redis):
         self._repository = repository
@@ -40,11 +61,14 @@ class ScriptService:
         self._redis = redis
 
     async def _check_rate_limit(self, user_id: UUID) -> None:
+        plan = await billing.get_active_plan(self._db, user_id)
+        limit = _RATE_LIMIT_BY_PLAN.get(plan, _DEFAULT_RATE_LIMIT_PER_HOUR)
+
         key = f"ratelimit:{user_id}:script_generate"
         count = await self._redis.incr(key)
         if count == 1:
             await self._redis.expire(key, 60 * 60)
-        if count > _RATE_LIMIT_PER_HOUR:
+        if count > limit:
             raise ScriptGenerationLimitError("Hourly script generation limit reached")
 
     async def _build_prompt(self, channel_id: UUID, topic: str) -> str:
@@ -59,11 +83,28 @@ class ScriptService:
             f"{'; '.join(v.summary or v.title for v in context.videos[:3]) or 'none yet'}"
         )
 
-    async def generate(self, *, user_id: UUID, channel_id: UUID, topic: str, premium: bool):
+    async def generate(
+        self,
+        *,
+        user_id: UUID,
+        channel_id: UUID,
+        topic: str,
+        topic_id: UUID | None = None,
+        language: str = "en",
+        platform: str = "youtube_long",
+        premium: bool,
+    ):
         await self._check_rate_limit(user_id)
 
+        # script_team is feature-flagged off by default (ARCHITECTURE.md §7)
+        # — until it measurably beats the single agent, premium requests
+        # silently fall back to it rather than erroring.
+        use_team = premium and await feature_flags.is_enabled(
+            self._db, self._redis, _SCRIPT_TEAM_FLAG, user_id, default=False
+        )
+
         prompt = await self._build_prompt(channel_id, topic)
-        agent = get_script_team() if premium else get_script_agent()
+        agent = get_script_team() if use_team else get_script_agent(platform)
         result = await agent.arun(prompt)
         generated = result.content
         if isinstance(generated, str) or generated is None:
@@ -71,7 +112,7 @@ class ScriptService:
                 "Script generation returned unparseable output — please retry"
             )
         usage = extract_usage(result)
-        agent_entry = get_script_agent_entry(premium)
+        agent_entry = get_script_agent_entry(use_team)
         voice_profile_version = await voice_profiles.get_current_profile_version(
             self._db, channel_id
         )
@@ -80,14 +121,20 @@ class ScriptService:
             user_id=user_id,
             channel_id=channel_id,
             topic=topic,
+            topic_id=topic_id,
+            language=language,
+            platform=platform,
             hook=generated.hook,
             body=generated.body,
             cta=generated.cta,
+            b_roll_suggestions=generated.b_roll_suggestions,
+            power_word_spans=generated.power_word_spans,
+            duration_estimate_seconds=generated.estimated_duration_seconds,
             voice_profile_version=voice_profile_version,
-            agent_name="script_team" if premium else "script",
+            agent_name="script_team" if use_team else "script",
             agent_version=agent_entry.version,
             prompt_version=agent_entry.prompt_version,
-            model_id=get_settings().openrouter_model,
+            model_id=get_settings().openrouter_model if use_team else _model_id_for(platform),
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             cost=usage.cost,
@@ -116,13 +163,39 @@ class ScriptService:
         await self._check_rate_limit(user_id)
 
         prompt = await self._build_prompt(script.channel_id, script.topic)
-        return get_script_stream_agent(), prompt
+        return get_script_stream_agent(script.platform), prompt
 
-    async def rate(self, script_id: UUID, rating: int):
-        script = await self._repository.set_rating(script_id, rating)
-        if script is not None:
-            emit(SCRIPT_RATED, {"script_id": str(script_id), "rating": rating})
+    async def rate(
+        self, *, user_id: UUID, script_id: UUID, rating: int, detail: dict | None = None
+    ):
+        # Ownership check is mandatory (ARCHITECTURE.md §4 rule 7) — ratings
+        # feed the refinement loop, so a foreign rating would poison another
+        # creator's Voice DNA.
+        script = await self._repository.get_by_id(script_id)
+        if script is None or script.user_id != user_id:
+            raise ScriptNotFoundError("Script not found")
+        script = await self._repository.set_rating(script_id, rating, detail)
+        emit(
+            SCRIPT_RATED,
+            {"script_id": str(script_id), "rating": rating, "detail": detail},
+        )
         return script
+
+    async def set_final_text(self, *, user_id: UUID, script_id: UUID, final_text: str):
+        """Persists the creator-edited version — the richest refinement
+        signal (TechnicalDesign.md §5.3): diffing this vs the generated
+        hook/body/cta shows what the creator actually changed.
+        """
+        script = await self._repository.get_by_id(script_id)
+        if script is None or script.user_id != user_id:
+            raise ScriptNotFoundError("Script not found")
+        return await self._repository.set_final_text(script_id, final_text)
+
+    async def get_rating_summary_by_profile_version(self, channel_id: UUID):
+        """M6 measurement query (TechnicalDesign.md §6.3) — ownership is
+        checked by the router (channel-scoped read, same pattern as
+        analytics/voice_profiles)."""
+        return await self._repository.rating_summary_by_profile_version(channel_id)
 
     async def publish(self, *, user_id: UUID, script_id: UUID, external_video_id: str) -> None:
         """Marks a script as published to a specific video — triggers the

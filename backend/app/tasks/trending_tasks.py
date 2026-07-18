@@ -1,4 +1,3 @@
-import asyncio
 from datetime import timedelta
 
 import structlog
@@ -17,7 +16,7 @@ from app.config import get_settings
 from app.modules.trending.events import TRENDING_COLD_NICHE_REQUESTED
 from app.modules.trending.repository import TrendingRepository
 from app.modules.trending.service import TrendingService
-from app.shared.events import subscribe
+from app.shared.events import run_with_event_flush, subscribe
 from app.tasks.celery_app import celery_app
 
 log = structlog.get_logger(__name__)
@@ -52,7 +51,7 @@ def refresh_trending_topics() -> None:
 def ingest_trending(self, niche: str, language: str) -> None:
     """Fetches topic signals + top competitor videos (thin body — logic lives in the service)."""
     try:
-        asyncio.run(_ingest(niche, language))
+        run_with_event_flush(_ingest(niche, language))
     except Exception as exc:
         raise self.retry(exc=exc) from exc
 
@@ -74,7 +73,7 @@ def ingest_cold_niche(self, payload: dict) -> None:
 def purge_expired_trending_data(self) -> None:
     """Hard-deletes soft-deleted trending rows past retention (thin body — see repository)."""
     try:
-        purged = asyncio.run(_purge())
+        purged = run_with_event_flush(_purge())
         log.info("trending_purge_completed", rows_deleted=purged)
     except Exception as exc:
         raise self.retry(exc=exc) from exc

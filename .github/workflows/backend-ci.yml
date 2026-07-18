@@ -1,0 +1,73 @@
+name: backend-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: creator_intelligence
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/creator_intelligence
+      SUPABASE_JWT_SECRET: ci-test-secret
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: redis://localhost:6379/1
+      CELERY_RESULT_BACKEND: redis://localhost:6379/2
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Run tests
+        run: pytest tests/ -q
+
+      # Catches migration bugs before merge — this repo has twice needed a
+      # manual fix for a migration that failed against real data (missing
+      # server_default on a NOT NULL column added to a non-empty table).
+      - name: Apply migrations against a throwaway Postgres
+        run: alembic upgrade head
+
+      - name: Export OpenAPI schema
+        run: |
+          python -c "
+          import json
+          from app.main import app
+          with open('openapi.json', 'w') as f:
+              json.dump(app.openapi(), f)
+          "
+
+      - name: Upload OpenAPI schema artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-schema
+          path: backend/openapi.json

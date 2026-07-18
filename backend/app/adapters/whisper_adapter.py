@@ -19,10 +19,14 @@ class WhisperAdapter:
     def __init__(self) -> None:
         self._client = AsyncOpenAI(api_key=get_settings().openai_api_key)
 
-    async def transcribe(self, audio_bytes: bytes) -> tuple[str, float]:
+    async def transcribe(self, audio_bytes: bytes) -> tuple[str, float, str]:
         audio_file = io.BytesIO(audio_bytes)
         audio_file.name = "audio.mp3"
         response = await self._client.audio.transcriptions.create(
-            model="whisper-1", file=audio_file
+            model="whisper-1", file=audio_file, response_format="verbose_json"
         )
-        return response.text, _WHISPER_QUALITY_SCORE
+        # verbose_json's `language` is a full name (e.g. "english"), not an
+        # ISO code like captions give — stored as-is; both are just an
+        # informational language_detected field, not joined against anything.
+        language = getattr(response, "language", "") or ""
+        return response.text, _WHISPER_QUALITY_SCORE, language

@@ -6,12 +6,15 @@ from fastapi.responses import StreamingResponse
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules import channels
 from app.modules.scripts.repository import ScriptRepository
 from app.modules.scripts.schemas import (
+    ScriptFinalTextRequest,
     ScriptGenerateRequest,
     ScriptPublishRequest,
     ScriptRateRequest,
     ScriptRead,
+    VoiceProfileRatingSummary,
 )
 from app.modules.scripts.service import (
     ScriptGenerationFailedError,
@@ -44,6 +47,9 @@ async def generate_script(
             user_id=UUID(user.user_id),
             channel_id=body.channel_id,
             topic=body.topic,
+            topic_id=body.topic_id,
+            language=body.language,
+            platform=body.platform,
             premium=body.premium,
         )
     except ScriptGenerationLimitError as exc:
@@ -84,12 +90,46 @@ async def stream_script(
 async def rate_script(
     script_id: UUID,
     body: ScriptRateRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
     service: Annotated[ScriptService, Depends(get_service)],
 ):
-    script = await service.rate(script_id, body.rating)
-    if script is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Script not found")
+    try:
+        script = await service.rate(
+            user_id=UUID(user.user_id), script_id=script_id, rating=body.rating, detail=body.detail
+        )
+    except ScriptNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     return script
+
+
+@router.patch("/{script_id}/final-text", response_model=ScriptRead)
+async def set_final_text(
+    script_id: UUID,
+    body: ScriptFinalTextRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    service: Annotated[ScriptService, Depends(get_service)],
+):
+    try:
+        script = await service.set_final_text(
+            user_id=UUID(user.user_id), script_id=script_id, final_text=body.final_text
+        )
+    except ScriptNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return script
+
+
+@router.get("/measurement/{channel_id}", response_model=list[VoiceProfileRatingSummary])
+async def get_rating_measurement(
+    channel_id: UUID,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    service: Annotated[ScriptService, Depends(get_service)],
+):
+    """M6 measurement query (TechnicalDesign.md §6.3) — "does profile v(n+1)
+    beat v(n)?" answered by query, not manual archaeology."""
+    if not await channels.verify_ownership(db, channel_id, UUID(user.user_id)):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found")
+    return await service.get_rating_summary_by_profile_version(channel_id)
 
 
 @router.post("/{script_id}/publish", status_code=status.HTTP_204_NO_CONTENT)

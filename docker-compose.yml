@@ -46,6 +46,11 @@ services:
     depends_on:
       - redis
 
+  # Queue-depth / task-failure dashboard (ARCHITECTURE.md §11 B10) — check
+  # here first for stuck/backed-up queues. Permanently-failed tasks (past
+  # max_retries) also land in Redis key `dead_letter:tasks`
+  # (app/tasks/celery_app.py::_record_dead_letter) for a queryable trail
+  # even without this UI open.
   flower:
     build: ./backend
     command: celery -A app.tasks.celery_app flower --port=5555

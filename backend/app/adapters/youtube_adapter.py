@@ -88,7 +88,7 @@ class YouTubeAdapter:
             response.raise_for_status()
             return response.json().get("items", [])
 
-    async def get_captions(self, video_id: str) -> tuple[str, float] | None:
+    async def get_captions(self, video_id: str) -> tuple[str, float, str] | None:
         """Public captions via the timedtext endpoint (no OAuth required —
         unlike the Data API's captions.download, which needs the channel
         owner's consent token). Returns None when no captions are available,
@@ -101,7 +101,7 @@ class YouTubeAdapter:
         text = " ".join(snippet.text for snippet in transcript).strip()
         if not text:
             return None
-        return text, _CAPTION_QUALITY_SCORE
+        return text, _CAPTION_QUALITY_SCORE, transcript.language_code
 
     async def download_audio(self, video_id: str) -> bytes | None:
         """Audio for the Whisper fallback path — only ever called for a

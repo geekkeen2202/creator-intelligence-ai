@@ -1,4 +1,3 @@
-import asyncio
 from datetime import UTC, datetime
 
 import structlog
@@ -10,6 +9,7 @@ from app.config import get_settings
 from app.modules import channels
 from app.modules.analytics.repository import AnalyticsRepository
 from app.modules.analytics.service import AnalyticsService
+from app.shared.events import run_with_event_flush
 from app.tasks.celery_app import celery_app
 
 log = structlog.get_logger(__name__)
@@ -19,7 +19,7 @@ log = structlog.get_logger(__name__)
 def sync_analytics(self) -> None:
     """Runs daily via Celery Beat for every connected channel (thin body — logic below)."""
     try:
-        asyncio.run(_sync_all())
+        run_with_event_flush(_sync_all())
     except Exception as exc:
         raise self.retry(exc=exc) from exc
 
@@ -56,6 +56,7 @@ async def _sync_all() -> None:
                         watch_time_minutes=0,
                         subscribers_gained=int(stats.get("subscriberCount", 0)),
                     )
+                    await channels.update_channel_stats(session, channel_id, stats)
                 except Exception as exc:
                     log.warning(
                         "channel_analytics_sync_failed", channel_id=str(channel_id), error=str(exc)

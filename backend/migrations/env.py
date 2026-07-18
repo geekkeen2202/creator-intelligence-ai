@@ -6,7 +6,6 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
-from app.shared.database import Base
 
 # Import every module's models so autogenerate can see them.
 from app.modules.analytics import models as analytics_models  # noqa: F401
@@ -18,7 +17,11 @@ from app.modules.thumbnails import models as thumbnails_models  # noqa: F401
 from app.modules.trending import models as trending_models  # noqa: F401
 from app.modules.users import models as users_models  # noqa: F401
 from app.modules.voice_profiles import models as voice_profiles_models  # noqa: F401
-from app.shared import event_log  # noqa: F401
+from app.shared import (
+    event_log,  # noqa: F401
+    feature_flags,  # noqa: F401
+)
+from app.shared.database import Base
 
 config = context.config
 # Escape % so configparser interpolation survives URL-encoded credentials (e.g. %40).

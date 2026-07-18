@@ -1,4 +1,3 @@
-import asyncio
 from typing import Any
 from uuid import UUID
 
@@ -10,7 +9,7 @@ from app.modules import voice_profiles
 from app.modules.channels.events import CHANNEL_ANALYZED
 from app.modules.trending.classifier import classify_niche
 from app.modules.trending.repository import TrendingRepository
-from app.shared.events import subscribe
+from app.shared.events import run_with_event_flush, subscribe
 from app.tasks.celery_app import celery_app
 
 
@@ -48,7 +47,7 @@ def assign_channel_niche(self, payload: dict) -> None:
     or read traffic (see app/modules/trending/classifier.py).
     """
     try:
-        asyncio.run(_assign(UUID(payload["channel_id"])))
+        run_with_event_flush(_assign(UUID(payload["channel_id"])))
     except Exception as exc:
         raise self.retry(exc=exc) from exc
 

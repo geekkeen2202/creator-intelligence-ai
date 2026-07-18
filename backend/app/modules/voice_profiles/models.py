@@ -16,6 +16,9 @@ _EMBEDDING_DIM = 1536
 
 class Video(BaseModelMixin, Base):
     __tablename__ = "videos"
+    __table_args__ = (
+        UniqueConstraint("channel_id", "external_video_id", name="uq_videos_channel_external_id"),
+    )
 
     channel_id: Mapped[UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("channels.id"), index=True
@@ -32,6 +35,9 @@ class Transcript(BaseModelMixin, Base):
     video_id: Mapped[UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("videos.id"), index=True)
     source: Mapped[str] = mapped_column(String(16))  # captions | whisper
     quality_score: Mapped[float] = mapped_column(Float, default=0)
+    language_detected: Mapped[str | None] = mapped_column(String(16), default=None)
+    raw_text: Mapped[str] = mapped_column(Text, default="")
+    clean_text: Mapped[str] = mapped_column(Text, default="")
 
 
 class TranscriptSegment(BaseModelMixin, Base):
@@ -64,3 +70,4 @@ class VoiceProfile(BaseModelMixin, Base):
     confidence: Mapped[dict] = mapped_column(JSONB, default=dict)
     excerpt_ids: Mapped[list] = mapped_column(JSONB, default=list)
     extraction_prompt_version: Mapped[str] = mapped_column(String(32))
+    source: Mapped[str] = mapped_column(String(16), default="initial")  # initial | refinement

@@ -2,9 +2,13 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 
+from app.modules.scripts import router as scripts_router_module
 from app.modules.scripts import service as service_module
+from app.modules.scripts.router import get_rating_measurement
 from app.modules.scripts.service import (
+    ScriptGenerationLimitError,
     ScriptNotFoundError,
     ScriptService,
 )
@@ -36,6 +40,7 @@ class FakeScriptRepository:
     def __init__(self):
         self.scripts: dict = {}
         self.created_kwargs: dict | None = None
+        self.rating_summary: list = []
 
     async def get_by_id(self, script_id):
         return self.scripts.get(script_id)
@@ -46,11 +51,15 @@ class FakeScriptRepository:
         self.scripts[script.id] = script
         return script
 
-    async def set_rating(self, script_id, rating):
+    async def set_rating(self, script_id, rating, detail=None):
         script = self.scripts.get(script_id)
         if script is not None:
             script.rating = rating
+            script.rating_detail = detail
         return script
+
+    async def rating_summary_by_profile_version(self, channel_id):
+        return self.rating_summary
 
 
 class FakeRunOutput:
@@ -79,11 +88,24 @@ def redis():
     return FakeRedis()
 
 
+@pytest.fixture(autouse=True)
+def fake_active_plan(monkeypatch):
+    async def fake_get_active_plan(db, user_id):
+        return None  # free tier by default; override per-test if needed
+
+    monkeypatch.setattr(service_module.billing, "get_active_plan", fake_get_active_plan)
+
+
 async def test_generate_stamps_provenance_and_uses_voice_dna_prompt_block(
     repo, redis, monkeypatch
 ):
-    generated = SimpleNamespace(hook="h", body="b", cta="c")
-    monkeypatch.setattr(service_module, "get_script_agent", lambda: FakeAgent(generated))
+    generated = SimpleNamespace(
+        hook="h", body="b", cta="c", b_roll_suggestions=[], power_word_spans=[],
+        estimated_duration_seconds=None,
+    )
+    monkeypatch.setattr(
+        service_module, "get_script_agent", lambda platform="youtube_long": FakeAgent(generated)
+    )
 
     async def fake_prompt_block(db, redis_, channel_id):
         return "Voice DNA:\n  tone: energetic"
@@ -138,8 +160,13 @@ async def test_generate_stamps_provenance_and_uses_voice_dna_prompt_block(
 
 
 async def test_generate_falls_back_when_no_voice_profile_yet(repo, redis, monkeypatch):
-    generated = SimpleNamespace(hook="h", body="b", cta="c")
-    monkeypatch.setattr(service_module, "get_script_agent", lambda: FakeAgent(generated))
+    generated = SimpleNamespace(
+        hook="h", body="b", cta="c", b_roll_suggestions=[], power_word_spans=[],
+        estimated_duration_seconds=None,
+    )
+    monkeypatch.setattr(
+        service_module, "get_script_agent", lambda platform="youtube_long": FakeAgent(generated)
+    )
 
     async def fake_prompt_block(db, redis_, channel_id):
         return "Voice DNA: not yet available"
@@ -200,3 +227,67 @@ async def test_publish_emits_for_owner(repo, redis, monkeypatch):
     assert events == [
         ("script.published", {"script_id": str(script_id), "external_video_id": "vid123"})
     ]
+
+
+async def test_rate_denies_cross_user_script(repo, redis):
+    owner_id = uuid4()
+    script_id = uuid4()
+    repo.scripts[script_id] = SimpleNamespace(id=script_id, user_id=owner_id)
+
+    service = ScriptService(repo, db=None, redis=redis)
+
+    with pytest.raises(ScriptNotFoundError):
+        await service.rate(user_id=uuid4(), script_id=script_id, rating=5)
+
+
+async def test_rate_limit_uses_free_tier_default_when_no_plan(redis, monkeypatch):
+    async def fake_get_active_plan(db, user_id):
+        return None
+
+    monkeypatch.setattr(service_module.billing, "get_active_plan", fake_get_active_plan)
+    service = ScriptService(None, db=None, redis=redis)
+    user_id = uuid4()
+
+    for _ in range(service_module._RATE_LIMIT_BY_PLAN["free"]):
+        await service._check_rate_limit(user_id)
+
+    with pytest.raises(ScriptGenerationLimitError):
+        await service._check_rate_limit(user_id)
+
+
+async def test_rate_limit_uses_higher_ceiling_for_paid_plan(redis, monkeypatch):
+    async def fake_get_active_plan(db, user_id):
+        return "creator"
+
+    monkeypatch.setattr(service_module.billing, "get_active_plan", fake_get_active_plan)
+    service = ScriptService(None, db=None, redis=redis)
+    user_id = uuid4()
+
+    # More than the free-tier limit succeeds because the plan is "creator".
+    for _ in range(service_module._RATE_LIMIT_BY_PLAN["free"] + 1):
+        await service._check_rate_limit(user_id)
+
+
+async def test_get_rating_summary_by_profile_version_passes_through(repo, redis):
+    repo.rating_summary = [
+        {"voice_profile_version": 1, "rated_count": 3, "avg_rating": 4.0},
+        {"voice_profile_version": 2, "rated_count": 2, "avg_rating": 4.5},
+    ]
+    service = ScriptService(repo, db=None, redis=redis)
+
+    summary = await service.get_rating_summary_by_profile_version(uuid4())
+
+    assert summary == repo.rating_summary
+
+
+async def test_get_rating_measurement_denies_cross_user_access(monkeypatch):
+    async def fake_verify_ownership(db, channel_id, user_id):
+        return False
+
+    monkeypatch.setattr(scripts_router_module.channels, "verify_ownership", fake_verify_ownership)
+    user = SimpleNamespace(user_id=str(uuid4()))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_rating_measurement(uuid4(), user, db=None, service=None)
+
+    assert exc_info.value.status_code == 404

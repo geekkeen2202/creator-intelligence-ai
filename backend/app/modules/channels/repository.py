@@ -22,10 +22,20 @@ class ChannelRepository:
         return list(result.scalars().all())
 
     async def create(
-        self, *, user_id: UUID, platform: str, external_channel_id: str, title: str
+        self,
+        *,
+        user_id: UUID,
+        platform: str,
+        external_channel_id: str,
+        title: str,
+        handle: str | None = None,
     ) -> Channel:
         channel = Channel(
-            user_id=user_id, platform=platform, external_channel_id=external_channel_id, title=title
+            user_id=user_id,
+            platform=platform,
+            external_channel_id=external_channel_id,
+            title=title,
+            handle=handle,
         )
         self._db.add(channel)
         await self._db.commit()
@@ -36,4 +46,10 @@ class ChannelRepository:
         channel = await self.get_by_id(channel_id)
         if channel is not None:
             channel.current_voice_profile_id = voice_profile_id
+            await self._db.commit()
+
+    async def update_stats(self, channel_id: UUID, stats: dict) -> None:
+        channel = await self.get_by_id(channel_id)
+        if channel is not None:
+            channel.stats = stats
             await self._db.commit()

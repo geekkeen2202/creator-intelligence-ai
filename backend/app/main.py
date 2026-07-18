@@ -14,6 +14,8 @@ from app.modules.thumbnails import thumbnails_router
 from app.modules.trending import trending_router
 from app.modules.users import users_router
 from app.modules.voice_profiles import voice_profiles_router
+from app.shared import feature_flags
+from app.shared.database import async_session_factory
 
 settings = get_settings()
 structlog.configure(processors=[structlog.processors.JSONRenderer()])
@@ -54,6 +56,22 @@ for router in (
     notifications_router,
 ):
     app.include_router(router, prefix=API_V1_PREFIX)
+
+
+@app.on_event("startup")
+async def _register_feature_flags() -> None:
+    # script_team ships registered and disabled (ARCHITECTURE.md §7) — a row
+    # must exist so it can be flipped on later without a manual DB insert.
+    async with async_session_factory() as session:
+        await feature_flags.ensure_flag_exists(
+            session,
+            "script_team",
+            enabled=False,
+            description=(
+                "Multi-agent premium script generation — off until it beats "
+                "the single agent on ratings + voice-match."
+            ),
+        )
 
 
 @app.get("/health")
