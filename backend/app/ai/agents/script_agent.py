@@ -5,7 +5,10 @@ from pydantic import BaseModel
 from app.config import get_settings
 
 VERSION = "v1"
-PROMPT_VERSION = "v1"
+# v2: prompt now includes verbatim Voice DNA excerpts, not just the
+# structured dimension summary (closes the "profile and excerpts, always
+# both" gap — see voice_profiles.service._format_prompt_block).
+PROMPT_VERSION = "v2"
 
 # TechnicalDesign.md §7 — platforms whose scripts are short-form; routed to
 # the cheaper/faster model (§5.2 "Model routing by task type").

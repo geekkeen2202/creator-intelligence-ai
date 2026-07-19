@@ -129,7 +129,13 @@ subscription.started       subscription.cancelled     subscription.payment_faile
 analytics.synced
 ```
 Event payloads are versioned, additive-only (never remove/rename fields).
-Every emitted event is also appended to the `events` table (audit + refinement input).
+Every emitted event is also appended to the `events` table as an **audit-only** log.
+Voice DNA refinement does not replay events from this table — it reads ratings,
+edits, and outcome view-counts directly off `scripts`/`script_outcomes` (see
+`voice_profiles.service.refine_profile`), which is simpler than event-sourcing
+the same data and avoids maintaining two paths to the same signal. Revisit this
+choice only if a feature actually needs event replay (e.g. rebuilding derived
+state), not preemptively.
 
 ## 6. Ports & Adapters (External Dependencies)
 

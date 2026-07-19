@@ -83,6 +83,15 @@ class VoiceProfileRatingSummary(BaseModel):
     avg_rating: float | None
 
 
+class ScriptOutcomeSignal(BaseModel):
+    """Cross-module read for voice_profiles' refinement job (§5.3) — a
+    published script's hook and the view count it earned, a performance
+    signal distinct from creator ratings/edits."""
+
+    hook: str
+    views: int
+
+
 class ScriptFeedbackRead(BaseModel):
     """Cross-module read for voice_profiles' refinement job (§5.3) — the
     signals it needs (rating, rating_detail, generated-vs-final diff) without

@@ -139,6 +139,19 @@ class VoiceProfileRepository:
             by_transcript[segment.transcript_id].append(segment)
         return [by_transcript[t] for t in order]
 
+    async def list_segments_by_ids(self, segment_ids: list[UUID]) -> list[TranscriptSegment]:
+        """Fetches curated excerpt segments by id, preserving no particular
+        order (callers order by their own priority — see
+        _select_prompt_excerpts in voice_profiles/service.py)."""
+        if not segment_ids:
+            return []
+        result = await self._db.execute(
+            select(TranscriptSegment).where(
+                TranscriptSegment.id.in_(segment_ids), TranscriptSegment.deleted_at.is_(None)
+            )
+        )
+        return list(result.scalars().all())
+
     async def count_transcripts_for_channel(self, channel_id: UUID) -> int:
         result = await self._db.execute(
             select(func.count(Transcript.id))

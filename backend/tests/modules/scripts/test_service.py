@@ -151,7 +151,7 @@ async def test_generate_stamps_provenance_and_uses_voice_dna_prompt_block(
     assert repo.created_kwargs["voice_profile_version"] == 3
     assert repo.created_kwargs["agent_name"] == "script"
     assert repo.created_kwargs["agent_version"] == "v1"
-    assert repo.created_kwargs["prompt_version"] == "v1"
+    assert repo.created_kwargs["prompt_version"] == "v2"
     assert repo.created_kwargs["input_tokens"] == 10
     assert repo.created_kwargs["output_tokens"] == 20
     assert repo.created_kwargs["cost"] == 0.001

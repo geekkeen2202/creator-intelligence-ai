@@ -153,6 +153,25 @@ class ScriptRepository:
         )
         return result.scalars().first() is not None
 
+    async def list_outcome_signals_since(
+        self, channel_id: UUID, since: datetime
+    ) -> list[tuple[str, int]]:
+        """(hook, views) pairs for scripts on this channel matched to an
+        outcome since `since`, best-performing first — the performance-based
+        refinement signal (TechnicalDesign.md §5.3), distinct from creator
+        ratings/edits."""
+        result = await self._db.execute(
+            select(Script.hook, ScriptOutcome.views)
+            .join(ScriptOutcome, ScriptOutcome.script_id == Script.id)
+            .where(
+                Script.channel_id == channel_id,
+                Script.created_at >= since,
+                ScriptOutcome.views.is_not(None),
+            )
+            .order_by(ScriptOutcome.views.desc())
+        )
+        return [(row.hook, row.views) for row in result]
+
     async def rating_summary_by_profile_version(self, channel_id: UUID) -> list[dict]:
         """M6 exit criterion (TechnicalDesign.md §6.3): "the version-comparison
         query answers v2 vs v1 without manual archaeology." Ratings grouped

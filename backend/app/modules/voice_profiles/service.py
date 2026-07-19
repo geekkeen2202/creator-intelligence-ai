@@ -1,3 +1,4 @@
+import difflib
 import re
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
@@ -29,9 +30,25 @@ _VIDEOS_PER_CHANNEL = 15
 # this, there isn't enough signal for even a low-confidence profile.
 _MIN_TRANSCRIPTS_FOR_EXTRACTION = 2
 
-# Below this transcript count, confidence is "low" and the prompt explicitly
-# forbids fabricating catchphrases (ARCHITECTURE.md §7).
-_HIGH_CONFIDENCE_TRANSCRIPT_THRESHOLD = 5
+# Per-dimension confidence (TechnicalDesign.md §6.2): different dimensions
+# become trustworthy at different corpus sizes — tone/vocabulary read off
+# 1-2 videos, hook/cta style need 3-5, catchphrases need 10+ AND must
+# actually recur across batches (see _consolidate). Each entry is
+# (medium_at, high_at) in transcript count.
+_CONFIDENCE_THRESHOLDS: dict[str, tuple[int, int]] = {
+    "tone": (1, 2),
+    "vocabulary_level": (1, 2),
+    "pacing": (2, 3),
+    "hook_style": (3, 5),
+    "cta_style": (3, 5),
+    "signature_phrases": (6, 10),
+}
+
+# Catchphrases are the dimension most likely to be a hallucinated guess from
+# a thin corpus, so the extraction prompt's anti-fabrication instruction is
+# gated on the same bar as signature_phrases reaching "high" confidence —
+# one source of truth instead of a separate flat threshold.
+_ANTI_FABRICATION_THRESHOLD = _CONFIDENCE_THRESHOLDS["signature_phrases"][1]
 
 # Below this caption/whisper quality score, fall back captions->whisper.
 _MIN_CAPTION_QUALITY = 0.5
@@ -51,8 +68,29 @@ _MAX_EXCERPT_CHARS_PER_BATCH = 6000
 # get stored as the profile's curated few-shot excerpts.
 _MAX_CURATED_EXCERPTS = 12
 
+# Of the curated excerpts, how many actually get injected as verbatim
+# few-shot examples into the script-generation prompt (TechnicalDesign.md
+# §6.1 "profile and excerpts, always both") — kept small to bound prompt
+# token cost regardless of how many are curated/stored.
+_MAX_PROMPT_EXCERPTS = 5
+_MAX_EXCERPT_CHARS_IN_PROMPT = 300
+_PROMPT_EXCERPT_TYPE_PRIORITY = ("hook", "cta", "body", "transition")
+
 _PROMPT_BLOCK_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60  # safety-net TTL; real
 # invalidation happens on voice_profile.updated (ARCHITECTURE.md §10).
+
+# Refinement signals (TechnicalDesign.md §5.3): a compact word-level diff
+# between what was generated and what the creator actually kept, capped so
+# one heavily-rewritten script can't blow out the refinement prompt.
+_MAX_EDIT_DIFF_CHARS = 400
+
+# Outcome (view-count) signals only get surfaced to refinement once there's
+# enough published scripts to name distinct top/bottom performers — below
+# this, "top 2" and "bottom 2" would overlap and the signal is noise rather
+# than data (same "worse to guess than omit" principle as elsewhere in this
+# module).
+_MIN_OUTCOMES_FOR_PERFORMANCE_SIGNAL = 4
+_OUTCOME_SIGNALS_PER_SIDE = 2
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 _WHITESPACE = re.compile(r"\s+")
@@ -111,16 +149,46 @@ def _curate_excerpts(segments: list[TranscriptSegment]) -> list[TranscriptSegmen
     return curated[:_MAX_CURATED_EXCERPTS]
 
 
-def _consolidate(batch_results: list[VoiceDNA]) -> VoiceDNA:
+def _select_prompt_excerpts(segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
+    """Narrows curated excerpts down to the handful actually injected as
+    verbatim examples in the script prompt, preferring hook/cta segments
+    (most characteristic of "voice") over body/transition."""
+    by_type: dict[str, list[TranscriptSegment]] = defaultdict(list)
+    for segment in segments:
+        by_type[segment.segment_type].append(segment)
+    ordered: list[TranscriptSegment] = []
+    for segment_type in _PROMPT_EXCERPT_TYPE_PRIORITY:
+        ordered.extend(by_type.get(segment_type, []))
+    return ordered[:_MAX_PROMPT_EXCERPTS]
+
+
+def _format_excerpt_lines(segments: list[TranscriptSegment]) -> list[str]:
+    lines = []
+    for segment in segments:
+        text = segment.text.strip()
+        if len(text) > _MAX_EXCERPT_CHARS_IN_PROMPT:
+            text = text[:_MAX_EXCERPT_CHARS_IN_PROMPT].rstrip() + "..."
+        lines.append(f'  [{segment.segment_type}] "{text}"')
+    return lines
+
+
+def _consolidate(batch_results: list[VoiceDNA]) -> tuple[VoiceDNA, bool]:
     """Merges per-batch VoiceDNA analyses into one profile (TechnicalDesign
     §5.1 "consolidation pass"). Scalar dimensions take the most recent
     batch's read (batches are ordered most-recent-video-first); signature
     phrases are the recurring ones — a phrase seen in only one batch out of
     several is exactly the kind of one-off guess §6.2 says is worse to keep
     than to omit.
+
+    Returns (profile, phrases_confirmed) — phrases_confirmed is True only if
+    at least one phrase actually recurred across >=2 batches, i.e. the
+    corpus cross-checked itself. A single-batch extraction or a batch set
+    where nothing recurred means every phrase is still a one-shot guess, so
+    the caller must not report signature_phrases confidence above "low"
+    regardless of transcript count.
     """
     if len(batch_results) == 1:
-        return batch_results[0]
+        return batch_results[0], False
 
     latest = batch_results[0]
     phrase_first_seen: dict[str, str] = {}
@@ -134,11 +202,12 @@ def _consolidate(batch_results: list[VoiceDNA]) -> VoiceDNA:
             phrase_first_seen.setdefault(key, phrase.strip())
 
     recurring_keys = [key for key, count in phrase_counts.items() if count >= 2]
+    phrases_confirmed = bool(recurring_keys)
     if not recurring_keys:
         recurring_keys = list(phrase_first_seen.keys())
     recurring = [phrase_first_seen[key] for key in recurring_keys][:15]
 
-    return VoiceDNA(
+    voice_dna = VoiceDNA(
         tone=latest.tone,
         pacing=latest.pacing,
         vocabulary_level=latest.vocabulary_level,
@@ -146,6 +215,103 @@ def _consolidate(batch_results: list[VoiceDNA]) -> VoiceDNA:
         cta_style=latest.cta_style,
         signature_phrases=recurring,
     )
+    return voice_dna, phrases_confirmed
+
+
+def _confidence_tier(transcript_count: int, medium_at: int, high_at: int) -> str:
+    if transcript_count >= high_at:
+        return "high"
+    if transcript_count >= medium_at:
+        return "medium"
+    return "low"
+
+
+def _compute_confidence(transcript_count: int, phrases_confirmed: bool) -> dict[str, str]:
+    confidence = {}
+    for field, (medium_at, high_at) in _CONFIDENCE_THRESHOLDS.items():
+        tier = _confidence_tier(transcript_count, medium_at, high_at)
+        if field == "signature_phrases" and not phrases_confirmed:
+            tier = "low"
+        confidence[field] = tier
+    return confidence
+
+
+def _refine_signature_phrase_confidence(
+    prior_tier: str, prior_phrases: list[str], new_phrases: list[str]
+) -> str:
+    """Refinement makes a single LLM call with no cross-batch recurrence
+    check, so any signature phrase it introduces that wasn't already in the
+    prior (corpus-confirmed) profile is an unconfirmed guess — confidence
+    can only be carried forward, never upgraded, by a refinement pass.
+    """
+    prior_set = {p.strip().lower() for p in prior_phrases}
+    new_set = {p.strip().lower() for p in new_phrases}
+    if new_set <= prior_set:
+        return prior_tier
+    return "low"
+
+
+def _summarize_edit_diff(generated_text: str, final_text: str) -> str:
+    """Compact word-level diff between the generated script and the
+    creator's final edited version — the richest refinement signal
+    (TechnicalDesign.md §5.3): it shows exactly what a human changed, not
+    just that something did.
+    """
+    gen_words = generated_text.split()
+    final_words = final_text.split()
+    matcher = difflib.SequenceMatcher(None, gen_words, final_words)
+    parts = []
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        if op == "equal":
+            continue
+        removed = " ".join(gen_words[i1:i2])
+        added = " ".join(final_words[j1:j2])
+        if removed:
+            parts.append(f'-"{removed}"')
+        if added:
+            parts.append(f'+"{added}"')
+    summary = " ".join(parts).strip()
+    if not summary:
+        return "(only whitespace/formatting changed)"
+    if len(summary) > _MAX_EDIT_DIFF_CHARS:
+        summary = summary[:_MAX_EDIT_DIFF_CHARS].rstrip() + "..."
+    return summary
+
+
+def _build_feedback_signal_lines(feedback: list, outcomes: list) -> list[str]:
+    """Assembles refinement signal lines from two independent sources:
+    creator feedback (ratings + edits) and published-video performance
+    (view counts). Either can be empty — refinement proceeds on whatever
+    signal actually exists (TechnicalDesign.md §5.3).
+    """
+    signal_lines = []
+    for item in feedback:
+        if item.rating is not None:
+            detail = f" detail={item.rating_detail}" if item.rating_detail else ""
+            signal_lines.append(f'- Rated {item.rating}/5{detail} — hook: "{item.hook}"')
+        if item.final_text:
+            generated_text = f"{item.hook} {item.body} {item.cta}"
+            if item.final_text.strip() != generated_text.strip():
+                diff = _summarize_edit_diff(generated_text, item.final_text)
+                signal_lines.append(f'- Creator edited before use: {diff}')
+
+    if len(outcomes) >= _MIN_OUTCOMES_FOR_PERFORMANCE_SIGNAL:
+        # outcomes is already ordered best-performing first.
+        top = outcomes[:_OUTCOME_SIGNALS_PER_SIDE]
+        bottom = outcomes[-_OUTCOME_SIGNALS_PER_SIDE:]
+        for signal in top:
+            signal_lines.append(
+                f'- Published script got {signal.views} views (top performer) — '
+                f'hook: "{signal.hook}"'
+            )
+        for signal in bottom:
+            if signal not in top:
+                signal_lines.append(
+                    f'- Published script got {signal.views} views (bottom performer) — '
+                    f'hook: "{signal.hook}"'
+                )
+
+    return signal_lines
 
 
 class VoiceProfileService:
@@ -316,17 +482,16 @@ class VoiceProfileService:
             )
             return
 
-        high_confidence = transcript_count >= _HIGH_CONFIDENCE_TRANSCRIPT_THRESHOLD
+        high_confidence = transcript_count >= _ANTI_FABRICATION_THRESHOLD
         batch_results, all_segments = await self._run_batches(channel_id, high_confidence)
         if not batch_results:
             raise RuntimeError(
                 f"voice_dna agent returned unparseable output for every batch, channel {channel_id}"
             )
 
-        voice_dna = _consolidate(batch_results)
+        voice_dna, phrases_confirmed = _consolidate(batch_results)
         curated = _curate_excerpts(all_segments)
-        confidence_label = "high" if high_confidence else "low"
-        confidence = {field: confidence_label for field in VoiceDNA.model_fields}
+        confidence = _compute_confidence(transcript_count, phrases_confirmed)
 
         next_version = await self._repository.get_latest_version_number(channel_id) + 1
         profile = await self._repository.create_version(
@@ -339,7 +504,7 @@ class VoiceProfileService:
             source="initial",
         )
         await channels.set_current_voice_profile_id(self._db, channel_id, profile.id)
-        await self._refresh_prompt_block_cache(channel_id, voice_dna)
+        await self._refresh_prompt_block_cache(channel_id, voice_dna, curated, confidence)
         emit(
             VOICE_PROFILE_UPDATED,
             {"channel_id": str(channel_id), "version": next_version},
@@ -357,18 +522,10 @@ class VoiceProfileService:
             return False  # nothing to refine — extract_voice_profile owns v1
 
         feedback = await scripts.list_feedback_since(self._db, channel_id, latest.created_at)
-        if not feedback:
-            return False
-
-        signal_lines = []
-        for item in feedback:
-            if item.rating is not None:
-                detail = f" detail={item.rating_detail}" if item.rating_detail else ""
-                signal_lines.append(f"- Rated {item.rating}/5{detail} — hook: \"{item.hook}\"")
-            if item.final_text and item.final_text not in (item.hook, item.body, item.cta):
-                signal_lines.append(
-                    f"- Creator edited a generated script before use (hook: \"{item.hook}\")"
-                )
+        outcomes = await scripts.list_outcome_signals_since(
+            self._db, channel_id, latest.created_at
+        )
+        signal_lines = _build_feedback_signal_lines(feedback, outcomes)
         if not signal_lines:
             return False
 
@@ -391,18 +548,34 @@ class VoiceProfileService:
             )
         voice_dna: VoiceDNA = result.content
 
+        # Refinement makes one uncorroborated LLM call — confidence can only
+        # be carried forward or downgraded, never upgraded, by this pass.
+        # signature_phrases is the dimension most at risk of a plausible-
+        # looking fabrication, so it's the one explicitly re-checked here.
+        new_confidence = dict(latest.confidence)
+        new_confidence["signature_phrases"] = _refine_signature_phrase_confidence(
+            latest.confidence.get("signature_phrases", "low"),
+            current_profile.signature_phrases,
+            voice_dna.signature_phrases,
+        )
+
         next_version = latest.version + 1
         profile = await self._repository.create_version(
             channel_id=channel_id,
             version=next_version,
             profile=voice_dna.model_dump(),
-            confidence=latest.confidence,
+            confidence=new_confidence,
             excerpt_ids=latest.excerpt_ids,
             extraction_prompt_version=PROMPT_VERSION,
             source="refinement",
         )
         await channels.set_current_voice_profile_id(self._db, channel_id, profile.id)
-        await self._refresh_prompt_block_cache(channel_id, voice_dna)
+        excerpt_segments = await self._repository.list_segments_by_ids(
+            [UUID(i) for i in latest.excerpt_ids]
+        )
+        await self._refresh_prompt_block_cache(
+            channel_id, voice_dna, excerpt_segments, new_confidence
+        )
         emit(
             VOICE_PROFILE_UPDATED,
             {"channel_id": str(channel_id), "version": next_version},
@@ -411,10 +584,16 @@ class VoiceProfileService:
 
     # --------------------------------------------------------------- prompt block
 
-    async def _refresh_prompt_block_cache(self, channel_id: UUID, voice_dna: VoiceDNA) -> None:
+    async def _refresh_prompt_block_cache(
+        self,
+        channel_id: UUID,
+        voice_dna: VoiceDNA,
+        excerpts: list[TranscriptSegment],
+        confidence: dict[str, str] | None = None,
+    ) -> None:
         await self._redis.set(
             f"promptblock:{channel_id}",
-            _format_prompt_block(voice_dna),
+            _format_prompt_block(voice_dna, excerpts, confidence),
             ex=_PROMPT_BLOCK_CACHE_TTL_SECONDS,
         )
 
@@ -422,12 +601,32 @@ class VoiceProfileService:
 _NOT_YET_AVAILABLE = "Voice DNA: not yet available"
 
 
-def _format_prompt_block(voice_dna: VoiceDNA) -> str:
+def _format_prompt_block(
+    voice_dna: VoiceDNA,
+    excerpts: list[TranscriptSegment] | None = None,
+    confidence: dict[str, str] | None = None,
+) -> str:
+    confidence = confidence or {}
     lines = ["Voice DNA:"]
     for field, value in voice_dna.model_dump().items():
+        tier = confidence.get(field)
+        if field == "signature_phrases" and tier == "low":
+            # An unconfirmed catchphrase is worse to hand to the script
+            # generator than none at all (TechnicalDesign.md §6.2) — omit
+            # the whole field rather than pass along a guess.
+            continue
         if isinstance(value, list):
             value = ", ".join(value) or "none"
-        lines.append(f"  {field}: {value}")
+        suffix = " (tentative)" if tier == "low" else ""
+        lines.append(f"  {field}{suffix}: {value}")
+
+    selected = _select_prompt_excerpts(excerpts or [])
+    if selected:
+        # Verbatim passages, not paraphrased descriptions — a creator's own
+        # phrasing teaches an LLM "voice" better than adjectives describing
+        # it (TechnicalDesign.md §6.1).
+        lines.append("Example passages in this creator's own words:")
+        lines.extend(_format_excerpt_lines(selected))
     return "\n".join(lines)
 
 
@@ -445,7 +644,8 @@ async def get_prompt_block(db: AsyncSession, redis: Redis, channel_id: UUID) -> 
     if profile_id is None:
         return _NOT_YET_AVAILABLE
 
-    voice_profile = await VoiceProfileRepository(db).get_by_id(profile_id)
+    repository = VoiceProfileRepository(db)
+    voice_profile = await repository.get_by_id(profile_id)
     if voice_profile is None:
         return _NOT_YET_AVAILABLE
 
@@ -457,7 +657,10 @@ async def get_prompt_block(db: AsyncSession, redis: Redis, channel_id: UUID) -> 
         )
         return _NOT_YET_AVAILABLE
 
-    block = _format_prompt_block(voice_dna)
+    excerpt_segments = await repository.list_segments_by_ids(
+        [UUID(i) for i in voice_profile.excerpt_ids]
+    )
+    block = _format_prompt_block(voice_dna, excerpt_segments, voice_profile.confidence)
     await redis.set(cache_key, block, ex=_PROMPT_BLOCK_CACHE_TTL_SECONDS)
     return block
 

@@ -6,7 +6,8 @@ from app.ai.agents.script_agent import GeneratedScript
 from app.config import get_settings
 
 VERSION = "v1"
-PROMPT_VERSION = "v1"
+# v2: prompt now includes verbatim Voice DNA excerpts — see script_agent.py.
+PROMPT_VERSION = "v2"
 
 
 def build_premium_script_team() -> Team:
