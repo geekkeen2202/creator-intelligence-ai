@@ -352,7 +352,10 @@ def test_format_prompt_block_includes_verbatim_excerpts():
 
 def test_select_prompt_excerpts_prioritizes_hook_and_cta_and_caps_count():
     segments = (
-        [TranscriptSegment(transcript_id=uuid4(), segment_type="body", text=f"body{n}") for n in range(6)]
+        [
+            TranscriptSegment(transcript_id=uuid4(), segment_type="body", text=f"body{n}")
+            for n in range(6)
+        ]
         + [TranscriptSegment(transcript_id=uuid4(), segment_type="hook", text="hook1")]
         + [TranscriptSegment(transcript_id=uuid4(), segment_type="cta", text="cta1")]
     )
@@ -542,7 +545,9 @@ def test_summarize_edit_diff_reports_whitespace_only_changes():
 
 def test_build_feedback_signal_lines_includes_rating_and_edit_diff():
     feedback = [
-        SimpleNamespace(rating=4, rating_detail=None, hook="h1", body="b1", cta="c1", final_text=None),
+        SimpleNamespace(
+            rating=4, rating_detail=None, hook="h1", body="b1", cta="c1", final_text=None
+        ),
         SimpleNamespace(
             rating=None,
             rating_detail=None,
@@ -654,7 +659,11 @@ async def test_refine_profile_downgrades_signature_phrase_confidence_on_new_phra
     repo.get_latest_version = lambda channel_id: _async_return(latest)
 
     async def fake_list_feedback_since(db, channel_id, since):
-        return [SimpleNamespace(rating=5, rating_detail=None, hook="h", body="b", cta="c", final_text=None)]
+        return [
+            SimpleNamespace(
+                rating=5, rating_detail=None, hook="h", body="b", cta="c", final_text=None
+            )
+        ]
 
     async def fake_list_outcome_signals_since(db, channel_id, since):
         return []
@@ -663,7 +672,9 @@ async def test_refine_profile_downgrades_signature_phrase_confidence_on_new_phra
     monkeypatch.setattr(
         service_module.scripts, "list_outcome_signals_since", fake_list_outcome_signals_since
     )
-    monkeypatch.setattr(service_module.channels, "set_current_voice_profile_id", lambda *a: _async_return(None))
+    monkeypatch.setattr(
+        service_module.channels, "set_current_voice_profile_id", lambda *a: _async_return(None)
+    )
     monkeypatch.setattr(service_module, "emit", lambda name, payload: None)
     _stub_prompts(monkeypatch)
 

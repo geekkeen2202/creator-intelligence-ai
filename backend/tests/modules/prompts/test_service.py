@@ -32,7 +32,9 @@ class FakePromptRepository:
         return self.active_template
 
     async def create_version(self, *, feature, template):
-        row = SimpleNamespace(id=uuid4(), feature=feature, version=2, template=template, is_active=True)
+        row = SimpleNamespace(
+            id=uuid4(), feature=feature, version=2, template=template, is_active=True
+        )
         self.created_kwargs = {"feature": feature, "template": template}
         return row
 
@@ -101,7 +103,10 @@ async def test_set_active_template_writes_version_and_refreshes_cache(monkeypatc
 
     assert row.version == 2
     assert fake_repo.created_kwargs == {"feature": "script_generation", "template": "new text"}
-    assert redis.store["prompttemplate:script_generation"] == '{"template": "new text", "version": 2}'
+    assert (
+        redis.store["prompttemplate:script_generation"]
+        == '{"template": "new text", "version": 2}'
+    )
 
 
 async def test_log_invocation_delegates_to_repository(monkeypatch):
