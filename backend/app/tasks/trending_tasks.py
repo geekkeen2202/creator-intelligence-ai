@@ -100,6 +100,7 @@ async def _ingest(niche: str, language: str) -> None:
             service = TrendingService(
                 TrendingRepository(session),
                 redis,
+                db=session,
                 trend_sources=[
                     YouTubeTrendsAdapter(),
                     GoogleTrendsAdapter(),

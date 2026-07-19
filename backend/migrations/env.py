@@ -12,6 +12,7 @@ from app.modules.analytics import models as analytics_models  # noqa: F401
 from app.modules.billing import models as billing_models  # noqa: F401
 from app.modules.channels import models as channels_models  # noqa: F401
 from app.modules.notifications import models as notifications_models  # noqa: F401
+from app.modules.prompts import models as prompts_models  # noqa: F401
 from app.modules.scripts import models as scripts_models  # noqa: F401
 from app.modules.thumbnails import models as thumbnails_models  # noqa: F401
 from app.modules.trending import models as trending_models  # noqa: F401

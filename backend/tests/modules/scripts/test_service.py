@@ -96,6 +96,22 @@ def fake_active_plan(monkeypatch):
     monkeypatch.setattr(service_module.billing, "get_active_plan", fake_get_active_plan)
 
 
+@pytest.fixture(autouse=True)
+def fake_prompts(monkeypatch):
+    # db=None in these tests, so prompts.get_active_prompt's real DB lookup
+    # would blow up — stub it to always report "no DB template row yet" (the
+    # graceful-degradation path), which is what these tests intend to
+    # exercise anyway.
+    async def fake_get_active_prompt(db, redis, feature, default):
+        return default, None
+
+    async def fake_log_invocation(db, **kwargs):
+        pass
+
+    monkeypatch.setattr(service_module.prompts, "get_active_prompt", fake_get_active_prompt)
+    monkeypatch.setattr(service_module.prompts, "log_invocation", fake_log_invocation)
+
+
 async def test_generate_stamps_provenance_and_uses_voice_dna_prompt_block(
     repo, redis, monkeypatch
 ):

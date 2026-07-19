@@ -2,6 +2,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.thumbnails.repository import ThumbnailRepository
@@ -11,14 +12,18 @@ from app.modules.thumbnails.service import (
     ThumbnailScriptNotFoundError,
     ThumbnailService,
 )
+from app.shared.cache import get_redis
 from app.shared.database import get_db
 from app.shared.security import CurrentUser, get_current_user
 
 router = APIRouter(prefix="/thumbnails", tags=["thumbnails"])
 
 
-def get_service(db: Annotated[AsyncSession, Depends(get_db)]) -> ThumbnailService:
-    return ThumbnailService(ThumbnailRepository(db), db)
+def get_service(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    redis: Annotated[Redis, Depends(get_redis)],
+) -> ThumbnailService:
+    return ThumbnailService(ThumbnailRepository(db), db, redis)
 
 
 @router.post("", response_model=ThumbnailBriefRead, status_code=status.HTTP_201_CREATED)

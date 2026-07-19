@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai.agents.script_agent import SHORT_FORM_PLATFORMS
 from app.ai.metrics import extract_usage
 from app.config import get_settings
-from app.modules import billing, trending, voice_profiles
+from app.modules import billing, prompts, trending, voice_profiles
 from app.modules.scripts.agents import (
     get_script_agent,
     get_script_agent_entry,
@@ -32,6 +32,11 @@ _RATE_LIMIT_BY_PLAN = {
     "unlimited": 200,
 }
 _DEFAULT_RATE_LIMIT_PER_HOUR = _RATE_LIMIT_BY_PLAN["free"]
+
+# DB-editable prompt instructions (prompts module) — fallback used only if
+# no active row exists yet for this feature.
+_SCRIPT_PROMPT_FEATURE = "script_generation"
+_DEFAULT_SCRIPT_INSTRUCTIONS = "Write a short-form video script using the following context."
 
 
 class ScriptGenerationLimitError(Exception):
@@ -71,10 +76,14 @@ class ScriptService:
         if count > limit:
             raise ScriptGenerationLimitError("Hourly script generation limit reached")
 
-    async def _build_prompt(self, channel_id: UUID, topic: str) -> str:
+    async def _build_prompt(self, channel_id: UUID, topic: str) -> tuple[str, int | None]:
+        instructions, template_version = await prompts.get_active_prompt(
+            self._db, self._redis, _SCRIPT_PROMPT_FEATURE, _DEFAULT_SCRIPT_INSTRUCTIONS
+        )
         voice_dna_block = await voice_profiles.get_prompt_block(self._db, self._redis, channel_id)
         context = await trending.get_channel_context(self._db, self._redis, channel_id)
-        return (
+        prompt = (
+            f"{instructions}\n"
             f"Topic: {topic}\n"
             f"{voice_dna_block}\n"
             f"Trending topics in this creator's niche: "
@@ -82,6 +91,7 @@ class ScriptService:
             f"Top competitor videos: "
             f"{'; '.join(v.summary or v.title for v in context.videos[:3]) or 'none yet'}"
         )
+        return prompt, template_version
 
     async def generate(
         self,
@@ -103,7 +113,7 @@ class ScriptService:
             self._db, self._redis, _SCRIPT_TEAM_FLAG, user_id, default=False
         )
 
-        prompt = await self._build_prompt(channel_id, topic)
+        prompt, template_version = await self._build_prompt(channel_id, topic)
         agent = get_script_team() if use_team else get_script_agent(platform)
         result = await agent.arun(prompt)
         generated = result.content
@@ -111,11 +121,19 @@ class ScriptService:
             raise ScriptGenerationFailedError(
                 "Script generation returned unparseable output — please retry"
             )
+        await prompts.log_invocation(
+            self._db,
+            feature=_SCRIPT_PROMPT_FEATURE,
+            template_version=template_version,
+            rendered_prompt=prompt,
+            reference_id=channel_id,
+        )
         usage = extract_usage(result)
         agent_entry = get_script_agent_entry(use_team)
         voice_profile_version = await voice_profiles.get_current_profile_version(
             self._db, channel_id
         )
+        prompt_version = prompts.format_prompt_version(template_version, agent_entry.prompt_version)
 
         script = await self._repository.create(
             user_id=user_id,
@@ -133,7 +151,7 @@ class ScriptService:
             voice_profile_version=voice_profile_version,
             agent_name="script_team" if use_team else "script",
             agent_version=agent_entry.version,
-            prompt_version=agent_entry.prompt_version,
+            prompt_version=prompt_version,
             model_id=get_settings().openrouter_model if use_team else _model_id_for(platform),
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
@@ -162,7 +180,14 @@ class ScriptService:
 
         await self._check_rate_limit(user_id)
 
-        prompt = await self._build_prompt(script.channel_id, script.topic)
+        prompt, template_version = await self._build_prompt(script.channel_id, script.topic)
+        await prompts.log_invocation(
+            self._db,
+            feature=_SCRIPT_PROMPT_FEATURE,
+            template_version=template_version,
+            rendered_prompt=prompt,
+            reference_id=script.channel_id,
+        )
         return get_script_stream_agent(script.platform), prompt
 
     async def rate(

@@ -7,6 +7,17 @@ from app.modules.thumbnails import service as service_module
 from app.modules.thumbnails.service import ThumbnailScriptNotFoundError, ThumbnailService
 
 
+class FakeRedis:
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def set(self, key, value, ex=None):
+        self.store[key] = value
+
+
 class FakeThumbnailRepository:
     def __init__(self):
         self.created_kwargs: dict | None = None
@@ -35,13 +46,27 @@ def repo():
     return FakeThumbnailRepository()
 
 
+@pytest.fixture(autouse=True)
+def fake_prompts(monkeypatch):
+    # db=None in these tests, so prompts.get_active_prompt's real DB lookup
+    # would blow up — stub it to always report "no DB template row yet".
+    async def fake_get_active_prompt(db, redis, feature, default):
+        return default, None
+
+    async def fake_log_invocation(db, **kwargs):
+        pass
+
+    monkeypatch.setattr(service_module.prompts, "get_active_prompt", fake_get_active_prompt)
+    monkeypatch.setattr(service_module.prompts, "log_invocation", fake_log_invocation)
+
+
 async def test_generate_denies_script_owned_by_another_user(repo, monkeypatch):
     async def fake_get_script_for_owner(db, script_id, user_id):
         return None  # scripts.get_script_for_owner already encodes the denial
 
     monkeypatch.setattr(service_module.scripts, "get_script_for_owner", fake_get_script_for_owner)
 
-    service = ThumbnailService(repo, db=None)
+    service = ThumbnailService(repo, db=None, redis=FakeRedis())
     with pytest.raises(ThumbnailScriptNotFoundError):
         await service.generate(user_id=uuid4(), script_id=uuid4())
 
@@ -64,7 +89,7 @@ async def test_generate_stamps_provenance_for_owned_script(repo, monkeypatch):
     monkeypatch.setattr(service_module.billing, "record_usage", fake_record_usage)
     monkeypatch.setattr(service_module, "emit", lambda *a, **k: None)
 
-    service = ThumbnailService(repo, db=None)
+    service = ThumbnailService(repo, db=None, redis=FakeRedis())
     script_id = uuid4()
     result = await service.generate(user_id=uuid4(), script_id=script_id)
 

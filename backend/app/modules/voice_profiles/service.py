@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.agents.voice_dna_agent import PROMPT_VERSION, VoiceDNA
 from app.config import get_settings
-from app.modules import billing, channels, scripts
+from app.modules import billing, channels, prompts, scripts
 from app.modules.voice_profiles.agents import get_voice_dna_agent
 from app.modules.voice_profiles.events import TRANSCRIPTS_COMPLETED, VOICE_PROFILE_UPDATED
 from app.modules.voice_profiles.models import TranscriptSegment, Video
@@ -91,6 +91,24 @@ _MAX_EDIT_DIFF_CHARS = 400
 # module).
 _MIN_OUTCOMES_FOR_PERFORMANCE_SIGNAL = 4
 _OUTCOME_SIGNALS_PER_SIDE = 2
+
+# DB-editable prompt instructions (prompts module) — these used to be
+# hardcoded string literals here. The text below is now only the fallback
+# used if no active row exists yet for the feature (graceful degradation,
+# same principle as voice_profiles.get_prompt_block's own fallback).
+_EXTRACTION_PROMPT_FEATURE = "voice_dna_extraction"
+_DEFAULT_EXTRACTION_INSTRUCTIONS = (
+    "Analyze these excerpts from a creator's past video transcripts and "
+    "extract their Voice DNA (tone, pacing, vocabulary level, hook style, "
+    "CTA style, and signature phrases)."
+)
+
+_REFINEMENT_PROMPT_FEATURE = "voice_dna_refinement"
+_DEFAULT_REFINEMENT_INSTRUCTIONS = (
+    "Adjust the profile to better reflect these signals. Keep any "
+    "dimension unchanged where the signals don't clearly suggest a change — "
+    "never fabricate a change to look productive."
+)
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 _WHITESPACE = re.compile(r"\s+")
@@ -427,7 +445,11 @@ class VoiceProfileService:
     # ------------------------------------------------------------- extraction
 
     async def _run_batches(
-        self, channel_id: UUID, high_confidence: bool
+        self,
+        channel_id: UUID,
+        base_instructions: str,
+        template_version: int | None,
+        high_confidence: bool,
     ) -> tuple[list[VoiceDNA], list[TranscriptSegment]]:
         transcript_groups = await self._repository.list_segments_by_transcript_for_channel(
             channel_id
@@ -437,11 +459,7 @@ class VoiceProfileService:
             for i in range(0, len(transcript_groups), _BATCH_SIZE_TRANSCRIPTS)
         ]
 
-        instructions = (
-            "Analyze these excerpts from a creator's past video transcripts and "
-            "extract their Voice DNA (tone, pacing, vocabulary level, hook style, "
-            "CTA style, and signature phrases)."
-        )
+        instructions = base_instructions
         if not high_confidence:
             instructions += (
                 " Only a small sample is available — do not fabricate signature "
@@ -460,6 +478,13 @@ class VoiceProfileService:
             prompt = f"{instructions}\n\nExcerpts:\n{excerpt_text}"
 
             result = await agent.arun(prompt)
+            await prompts.log_invocation(
+                self._db,
+                feature=_EXTRACTION_PROMPT_FEATURE,
+                template_version=template_version,
+                rendered_prompt=prompt,
+                reference_id=channel_id,
+            )
             if not isinstance(result.content, VoiceDNA):
                 # One bad batch shouldn't sink the whole extraction — same
                 # fan-out-isolation principle as per-video transcription
@@ -482,8 +507,13 @@ class VoiceProfileService:
             )
             return
 
+        base_instructions, template_version = await prompts.get_active_prompt(
+            self._db, self._redis, _EXTRACTION_PROMPT_FEATURE, _DEFAULT_EXTRACTION_INSTRUCTIONS
+        )
         high_confidence = transcript_count >= _ANTI_FABRICATION_THRESHOLD
-        batch_results, all_segments = await self._run_batches(channel_id, high_confidence)
+        batch_results, all_segments = await self._run_batches(
+            channel_id, base_instructions, template_version, high_confidence
+        )
         if not batch_results:
             raise RuntimeError(
                 f"voice_dna agent returned unparseable output for every batch, channel {channel_id}"
@@ -492,6 +522,7 @@ class VoiceProfileService:
         voice_dna, phrases_confirmed = _consolidate(batch_results)
         curated = _curate_excerpts(all_segments)
         confidence = _compute_confidence(transcript_count, phrases_confirmed)
+        extraction_prompt_version = prompts.format_prompt_version(template_version, PROMPT_VERSION)
 
         next_version = await self._repository.get_latest_version_number(channel_id) + 1
         profile = await self._repository.create_version(
@@ -500,7 +531,7 @@ class VoiceProfileService:
             profile=voice_dna.model_dump(),
             confidence=confidence,
             excerpt_ids=[str(s.id) for s in curated],
-            extraction_prompt_version=PROMPT_VERSION,
+            extraction_prompt_version=extraction_prompt_version,
             source="initial",
         )
         await channels.set_current_voice_profile_id(self._db, channel_id, profile.id)
@@ -529,19 +560,28 @@ class VoiceProfileService:
         if not signal_lines:
             return False
 
+        refinement_instructions, template_version = await prompts.get_active_prompt(
+            self._db, self._redis, _REFINEMENT_PROMPT_FEATURE, _DEFAULT_REFINEMENT_INSTRUCTIONS
+        )
         current_profile = VoiceDNA.model_validate(latest.profile)
         prompt = (
             "Current Voice DNA profile (JSON):\n"
             f"{current_profile.model_dump_json()}\n\n"
             "New creator feedback signals since this profile was set:\n"
             + "\n".join(signal_lines)
-            + "\n\nAdjust the profile to better reflect these signals. Keep any "
-            "dimension unchanged where the signals don't clearly suggest a change — "
-            "never fabricate a change to look productive."
+            + "\n\n"
+            + refinement_instructions
         )
 
         agent = get_voice_dna_agent()
         result = await agent.arun(prompt)
+        await prompts.log_invocation(
+            self._db,
+            feature=_REFINEMENT_PROMPT_FEATURE,
+            template_version=template_version,
+            rendered_prompt=prompt,
+            reference_id=channel_id,
+        )
         if not isinstance(result.content, VoiceDNA):
             raise RuntimeError(
                 f"voice_dna agent returned unparseable refinement output for channel {channel_id}"
@@ -560,13 +600,14 @@ class VoiceProfileService:
         )
 
         next_version = latest.version + 1
+        refinement_prompt_version = prompts.format_prompt_version(template_version, PROMPT_VERSION)
         profile = await self._repository.create_version(
             channel_id=channel_id,
             version=next_version,
             profile=voice_dna.model_dump(),
             confidence=new_confidence,
             excerpt_ids=latest.excerpt_ids,
-            extraction_prompt_version=PROMPT_VERSION,
+            extraction_prompt_version=refinement_prompt_version,
             source="refinement",
         )
         await channels.set_current_voice_profile_id(self._db, channel_id, profile.id)

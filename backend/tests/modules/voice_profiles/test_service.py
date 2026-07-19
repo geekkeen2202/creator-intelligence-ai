@@ -21,6 +21,23 @@ from app.modules.voice_profiles.service import (
 )
 
 
+def _stub_prompts(monkeypatch):
+    """These tests use db=None and a bare FakeRedis with no cached template,
+    so prompts.get_active_prompt's real DB lookup would blow up — stub it to
+    return the caller-supplied default (i.e. simulate "no DB template row
+    yet", the graceful-degradation path) and make log_invocation a no-op.
+    """
+
+    async def fake_get_active_prompt(db, redis, feature, default):
+        return default, None
+
+    async def fake_log_invocation(db, **kwargs):
+        pass
+
+    monkeypatch.setattr(service_module.prompts, "get_active_prompt", fake_get_active_prompt)
+    monkeypatch.setattr(service_module.prompts, "log_invocation", fake_log_invocation)
+
+
 class FakeRedis:
     def __init__(self):
         self.store: dict[str, str] = {}
@@ -239,6 +256,7 @@ async def test_extract_voice_profile_raises_clearly_on_unparseable_llm_output(mo
     monkeypatch.setattr(
         service_module, "get_voice_dna_agent", lambda: FakeAgent("not valid json")
     )
+    _stub_prompts(monkeypatch)
 
     service = VoiceProfileService(repo, db=None, redis=FakeRedis(), social=FakeSocial())
 
@@ -268,6 +286,7 @@ async def test_extract_voice_profile_confidence_is_per_dimension(monkeypatch):
         cta_style="soft",
     )
     monkeypatch.setattr(service_module, "get_voice_dna_agent", lambda: FakeAgent(voice_dna))
+    _stub_prompts(monkeypatch)
 
     set_calls = []
 
@@ -646,6 +665,7 @@ async def test_refine_profile_downgrades_signature_phrase_confidence_on_new_phra
     )
     monkeypatch.setattr(service_module.channels, "set_current_voice_profile_id", lambda *a: _async_return(None))
     monkeypatch.setattr(service_module, "emit", lambda name, payload: None)
+    _stub_prompts(monkeypatch)
 
     # Refined output introduces a phrase never seen in the prior, corpus-
     # confirmed profile — confidence must downgrade, not carry forward.

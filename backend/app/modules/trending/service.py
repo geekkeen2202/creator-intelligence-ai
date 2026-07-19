@@ -5,7 +5,9 @@ from uuid import UUID
 
 import structlog
 from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules import prompts
 from app.modules.trending.classifier import tokenize
 from app.modules.trending.models import TrendingTopic, TrendingVideo
 from app.modules.trending.niches import get_niche_config
@@ -50,7 +52,8 @@ _EXTERNAL_RATE_LIMIT_WINDOW_SECONDS = 60
 # no data yet, without blocking the request (ARCHITECTURE.md §10).
 _COLD_NICHE_LOCK_TTL_SECONDS = 10 * 60
 
-_SUMMARY_SYSTEM_PROMPT = (
+_SUMMARY_PROMPT_FEATURE = "trending_summarize"
+_DEFAULT_SUMMARY_SYSTEM_PROMPT = (
     "You analyze YouTube video metadata for content creators researching their niche. "
     "From the title, description, tags and stats, distill what the video covers, "
     "why it is performing, the hook style of its title, and the content angle."
@@ -62,12 +65,14 @@ class TrendingService:
         self,
         repository: TrendingRepository,
         redis: Redis,
+        db: AsyncSession | None = None,
         trend_sources: list[TrendSourcePort] | None = None,
         video_source: SocialPlatformPort | None = None,
         llm: LLMPort | None = None,
     ):
         self._repository = repository
         self._redis = redis
+        self._db = db
         self._trend_sources = trend_sources or []
         self._video_source = video_source
         self._llm = llm
@@ -356,8 +361,19 @@ class TrendingService:
         if self._llm is None or not videos:
             return
         targets = videos[:_VIDEOS_SUMMARIZED]
+
+        system_prompt, template_version = _DEFAULT_SUMMARY_SYSTEM_PROMPT, None
+        if self._db is not None:
+            # Fetched once for the whole batch, not per video — the prompt
+            # template can't change mid-batch, so refetching it per video
+            # (even against a warm Redis cache) is pure waste.
+            system_prompt, template_version = await prompts.get_active_prompt(
+                self._db, self._redis, _SUMMARY_PROMPT_FEATURE, _DEFAULT_SUMMARY_SYSTEM_PROMPT
+            )
+
         results = await asyncio.gather(
-            *(self._summarize_one(v) for v in targets), return_exceptions=True
+            *(self._summarize_one(v, system_prompt, template_version) for v in targets),
+            return_exceptions=True,
         )
         for video, result in zip(targets, results, strict=True):
             if isinstance(result, BaseException):
@@ -366,7 +382,9 @@ class TrendingService:
             video.summary = result.summary
             video.context = {**video.context, **result.model_dump()}
 
-    async def _summarize_one(self, video: TrendingVideo) -> VideoContext:
+    async def _summarize_one(
+        self, video: TrendingVideo, system_prompt: str, template_version: int | None
+    ) -> VideoContext:
         prompt = (
             f"Video title: {video.title}\n"
             f"Channel: {video.channel_title}\n"
@@ -374,6 +392,12 @@ class TrendingService:
             f"Stats: {json.dumps(video.stats)}\n"
             f"Description: {video.context.get('description', '')}"
         )
-        return await self._llm.generate_structured(
-            prompt, VideoContext, system=_SUMMARY_SYSTEM_PROMPT
-        )
+        result = await self._llm.generate_structured(prompt, VideoContext, system=system_prompt)
+        if self._db is not None:
+            await prompts.log_invocation(
+                self._db,
+                feature=_SUMMARY_PROMPT_FEATURE,
+                template_version=template_version,
+                rendered_prompt=f"[system]\n{system_prompt}\n\n[user]\n{prompt}",
+            )
+        return result
